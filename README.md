@@ -260,6 +260,53 @@ Actix Tower follows several guiding principles:
 
 ---
 
+# Architecture: Bridging `!Send` and `Send`
+
+Actix Web runs on a single-threaded local actor model where workers are `!Send`. Tower middleware is strictly built on `Send + Sync` futures. Bridging these paradigms without losing performance is the core achievement of `actix_tower`.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ActixWorker as Actix Worker (Thread-Local)
+    participant TowerCompat as TowerLayerCompat (Bridge)
+    participant TowerMW as Tower Middleware (Send)
+    participant Handler as Actix Handler
+    
+    Client->>ActixWorker: HTTP Request
+    ActixWorker->>TowerCompat: ServiceRequest
+    Note over TowerCompat: Convert to http::Request<ActixRequestBody>
+    TowerCompat->>TowerMW: poll_ready() & call()
+    Note over TowerMW: Executes Send + Sync logic (e.g. Rate Limit, Timeout)
+    TowerMW->>TowerCompat: http::Response<B>
+    Note over TowerCompat: Awaits Future, extracts Body
+    TowerCompat->>Handler: Forward Request if OK
+    Handler-->>TowerCompat: ServiceResponse
+    TowerCompat-->>ActixWorker: Map to BoxBody
+    ActixWorker-->>Client: HTTP Response
+```
+
+The bridge uses a local `Rc<RefCell<TowerService>>` wrapper that safely routes requests from the single-threaded Actix worker pool into the expected `Send` boundaries of the Tower service, completely satisfying Tower's `poll_ready` contract without causing race conditions.
+
+---
+
+# Advanced Integration & Troubleshooting
+
+When stacking multiple Tower layers alongside Actix middleware, ordering matters. 
+
+1. **Timeouts First:** Put `tower_http::timeout::TimeoutLayer` on the outermost edge so it can drop requests immediately if the server is overloaded.
+2. **Rate Limiting:** Place rate limiters before heavy authentication hashing.
+3. **Caching:** Cache responses for static or anonymous endpoints.
+
+### Common Trait Bound Errors
+
+If you see an error like this when using `TowerLayerCompat`:
+```text
+the trait bound `B: actix_web::body::MessageBody` is not satisfied
+```
+This means the Tower middleware is attempting to return a body type that Actix doesn't natively understand. `actix_tower` provides a `.map_into_boxed_body()` or `.map_err()` utility to resolve these bounds seamlessly. See the examples for complete setups.
+
+---
+
 # Examples
 
 Run the included examples:
