@@ -315,12 +315,7 @@ Please open an issue before making large architectural changes.
 
 # License
 
-Licensed under either of:
-
-- MIT License
-- Apache License 2.0
-
-at your option.
+Licensed under the Apache License, Version 2.0.
 
 ---
 
