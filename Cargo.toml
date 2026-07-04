@@ -1,11 +1,11 @@
 [package]
 name = "actix_tower"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Modern extensions for Actix Web — Tower compatibility, ergonomic extractors, and production-ready middleware."
 license = "Apache-2.0"
-repository = "https://github.com/actix-tower/actix-tower"
+repository = "https://github.com/rstosp/actix_tower"
 keywords = ["actix", "actix-web", "tower", "middleware", "web"]
 categories = ["web-programming::http-server"]
 
