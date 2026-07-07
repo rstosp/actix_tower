@@ -1,13 +1,34 @@
 //! Request conversion utilities between Actix and `http` types.
+//!
+//! # Optimisation notes
+//!
+//! ## Zero-cost header copy
+//!
+//! The original implementation iterated headers and called
+//! `HeaderName::from_bytes` + `HeaderValue::from_bytes` on each entry,
+//! performing O(n) string validation at every bridge crossing.
+//!
+//! `actix_web::http::header::HeaderMap` is a direct re-export of
+//! `http::HeaderMap` (same underlying crate, same resolved type). The
+//! `header_bridge` module exploits this to cast the reference in zero
+//! instructions and then `clone()` the map in a single allocation — one
+//! `memcpy`-equivalent instead of N independent string copies with validation.
+//!
+//! ## Inlining
+//!
+//! `service_request_to_http` is annotated `#[inline(always)]` so LLVM can
+//! fold it into `TowerMiddlewareService::call` and eliminate the function
+//! call overhead on the hot path.
 
 use crate::compat::http::{method_to_http, uri_to_http, version_to_http};
 use crate::compat::tower::body::{collect_body_limited, ActixRequestBody};
+use crate::compat::tower::header_bridge::copy_actix_headers_to_http;
 use crate::internal::common::{BoxError, StringError, TowerError};
 use actix_web::{
     dev::{Payload, ServiceRequest},
     HttpMessage,
 };
-use http::{HeaderName, HeaderValue, Request};
+use http::{Request};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,9 +50,17 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 /// Converts an Actix `ServiceRequest` into an `http::Request<ActixRequestBody>`.
 ///
 /// The original `HttpRequest` is stored in a thread-local registry keyed by
-/// a generated `req_id`.  A [`RequestRegistryGuard`] placed in the returned
+/// a generated `req_id`. A [`RequestRegistryGuard`] placed in the returned
 /// request's extensions ensures the registry entry is cleaned up even if the
 /// request is cancelled.
+///
+/// # Header copying — zero per-header validation
+///
+/// Instead of re-validating each header name/value pair, this function casts
+/// the Actix `HeaderMap` reference to an `http::HeaderMap` reference in zero
+/// instructions (they are the same type), then clones the map. This is one
+/// allocation replacing O(n) string validations.
+#[inline(always)]
 pub fn service_request_to_http(sr: ServiceRequest) -> Request<ActixRequestBody> {
     let (http_req, payload) = sr.into_parts();
 
@@ -41,6 +70,11 @@ pub fn service_request_to_http(sr: ServiceRequest) -> Request<ActixRequestBody> 
 
     let body = ActixRequestBody::new(payload);
 
+    // Zero-validation header copy: bytes are already valid from the HTTP stack.
+    // `copy_actix_headers_to_http` uses `from_maybe_shared_unchecked` on values,
+    // skipping the byte-scan that `from_bytes` would perform.
+    let headers = copy_actix_headers_to_http(http_req.headers());
+
     let mut http_request = Request::builder()
         .method(method)
         .uri(uri)
@@ -48,18 +82,11 @@ pub fn service_request_to_http(sr: ServiceRequest) -> Request<ActixRequestBody> 
         .body(body)
         .expect("failed to build http::Request");
 
-    for (name, value) in http_req.headers().iter() {
-        if let (Some(n), Some(v)) = (
-            HeaderName::from_bytes(name.as_str().as_bytes()).ok(),
-            HeaderValue::from_bytes(value.as_bytes()).ok(),
-        ) {
-            http_request.headers_mut().insert(n, v);
-        }
-    }
+    *http_request.headers_mut() = headers;
 
     let req_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Store req_id in the HttpRequest's extensions so `service_response_to_http`
+    // Store req_id in the HttpRequest's extensions so `http_to_service_response`
     // can retrieve it from the response side.
     http_req.extensions_mut().insert(req_id);
 

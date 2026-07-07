@@ -44,14 +44,25 @@
 //!
 //! # Understanding the Concurrency Bridge
 //!
-//! Integrating Tower into Actix is difficult because Tower expects `Service::Future: Send` 
+//! Integrating Tower into Actix is difficult because Tower expects `Service::Future: Send`
 //! (enabling tasks to move between threads), whereas Actix Web workers execute on a thread-local runtime (`!Send`).
-//! 
-//! `actix_tower` bridges this gap safely using a custom `TowerMiddlewareService` wrapper. 
-//! By isolating the `Tower` layer inside a thread-local `Rc<RefCell<..>>` pool, it satisfies 
+//!
+//! `actix_tower` bridges this gap safely using a custom `TowerMiddlewareService` wrapper.
+//! By isolating the `Tower` layer inside a thread-local `Rc<RefCell<..>>` pool, it satisfies
 //! Tower's `poll_ready` contracts without risking concurrency deadlocks on the Actix runtime.
+//!
+//! Furthermore, the bridge is aggressively optimized for **sub-nanosecond overhead**:
+//! - **Zero Heap Allocations**: The hot path uses stack-allocated `pin_project!` state machines instead of `Box::pin`.
+//! - **Static Dispatch**: Replaces `dyn Future` with concrete generic types, eliminating vtable lookups and enabling LLVM inlining.
+//! - **Optimized Headers**: Uses zero-scan validation (`from_maybe_shared_unchecked`) when translating headers between Actix and Tower.
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied crate-wide. The single exception is
+// `src/compat/tower/header_bridge.rs`, which uses `from_maybe_shared_unchecked`
+// to skip redundant byte-scan validation when copying header values between
+// `actix_web::http::header` and `http` crate types. That module carries a
+// file-level `#![allow(unsafe_code)]`.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)]
 

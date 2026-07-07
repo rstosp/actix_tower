@@ -43,6 +43,7 @@ impl HttpBody for ActixRequestBody {
     // Panicking on that error crashes the Actix worker; propagating it is correct.
     type Error = BoxError;
 
+    #[inline(always)]
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -121,6 +122,7 @@ impl<B: MessageBody> HttpBody for ActixResponseBody<B> {
     type Data = Bytes;
     type Error = crate::internal::common::BoxError;
 
+    #[inline(always)]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -164,6 +166,7 @@ impl<B> TowerBodyStream<B> {
 impl<B: HttpBody<Data = Bytes>> Stream for TowerBodyStream<B> {
     type Item = Result<Bytes, TowerBodyError<B::Error>>;
 
+    #[inline(always)]
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -77,7 +77,7 @@ async fn test_tower_backpressure_propagation() {
     let app = test::init_service(
         App::new()
             // Tower middleware on the outside
-            .wrap(tower_layer!(tower_http::timeout::TimeoutLayer::new(
+            .wrap(tower_layer!(tower::timeout::TimeoutLayer::new(
                 std::time::Duration::from_secs(10)
             )))
             // Actix backpressure middleware on the inside

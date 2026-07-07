@@ -18,6 +18,8 @@
 
 pub mod body;
 pub mod future;
+pub(crate) mod future_impl;
+pub(crate) mod header_bridge;
 pub mod layer;
 pub mod request;
 pub mod response;
