@@ -45,7 +45,6 @@ use crate::compat::tower::{
     future_impl::TowerMiddlewareFutureImpl,
     request::{
         http_to_service_request, service_request_to_http,
-        RequestRegistryGuard,
     },
     response::service_response_to_http,
 };
@@ -265,11 +264,10 @@ where
         let http_request = service_request_to_http(req);
 
         // Capture req_id before moving the request into the Tower middleware.
-        let req_id = http_request
+        let req_id = *http_request
             .extensions()
-            .get::<RequestRegistryGuard>()
-            .expect("RequestRegistryGuard missing from newly created request")
-            .req_id;
+            .get::<u64>()
+            .expect("req_id missing from newly created request extensions");
 
         // `borrow_mut()` is held only until `.call()` returns the Future.
         // The Future itself is then driven to completion WITHOUT holding the

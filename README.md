@@ -64,14 +64,14 @@ Actix Tower packages these common components into a reusable crate while remaini
 
 ```toml
 [dependencies]
-actix-tower = "0.1"
+actix-tower = "0.1.4"
 ```
 
 Enable optional features as needed.
 
 ```toml
 [dependencies]
-actix-tower = { version = "0.1", features = [
+actix-tower = { version = "0.1.4", features = [
     "tower",
     "middleware",
     "extract",
@@ -378,7 +378,7 @@ Licensed under the Apache License, Version 2.0.
 
 # Status
 
-**Version 0.1.0**
+**Version 0.1.4**
 
 The crate is available on crates.io.
 

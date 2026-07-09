@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 thread_local! {
+    /// Thread-local registry bridging Actix `HttpRequest` to Tower `http::Request`.
     pub(crate) static REQUEST_REGISTRY: RefCell<HashMap<u64, actix_web::HttpRequest>> = RefCell::new(HashMap::new());
     pub(crate) static RESPONSE_REGISTRY: RefCell<HashMap<u64, actix_web::HttpRequest>> = RefCell::new(HashMap::new());
 }
@@ -50,9 +51,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 /// Converts an Actix `ServiceRequest` into an `http::Request<ActixRequestBody>`.
 ///
 /// The original `HttpRequest` is stored in a thread-local registry keyed by
-/// a generated `req_id`. A [`RequestRegistryGuard`] placed in the returned
-/// request's extensions ensures the registry entry is cleaned up even if the
-/// request is cancelled.
+/// a generated `req_id`.
 ///
 /// # Header copying — zero per-header validation
 ///
@@ -94,9 +93,7 @@ pub fn service_request_to_http(sr: ServiceRequest) -> Request<ActixRequestBody> 
         registry.borrow_mut().insert(req_id, http_req);
     });
 
-    http_request
-        .extensions_mut()
-        .insert(RequestRegistryGuard { req_id });
+    http_request.extensions_mut().insert(req_id);
 
     http_request
 }
@@ -106,34 +103,25 @@ pub fn service_request_to_http(sr: ServiceRequest) -> Request<ActixRequestBody> 
 /// # Errors
 ///
 /// Returns an error if:
-/// - The [`RequestRegistryGuard`] has been removed from the request extensions
-///   (Tower middleware that strips extensions).
+/// - The request ID has been removed from the request extensions.
 /// - The request body exceeds `max_body_bytes`.
 /// - The request body stream returns an I/O error.
-///
-/// On error the corresponding `REQUEST_REGISTRY` entry is cleaned up.
 pub async fn http_to_service_request(
-    mut http_request: Request<ActixRequestBody>,
+    http_request: Request<ActixRequestBody>,
     max_body_bytes: usize,
 ) -> Result<ServiceRequest, actix_web::Error> {
-    // --- Retrieve the registry guard -------------------------------------------
-    // If missing, Tower middleware removed it (e.g. a sanitization layer that
-    // calls extensions_mut().clear()).  Return a typed error; never panic.
-    let guard = http_request
-        .extensions_mut()
-        .remove::<RequestRegistryGuard>()
+    // --- Retrieve the request ID -----------------------------------------------
+    let req_id = http_request
+        .extensions()
+        .get::<u64>()
+        .copied()
         .ok_or_else(|| {
             actix_web::Error::from(TowerError(Box::new(StringError(
-                "actix_tower: RequestRegistryGuard missing from http::Request extensions. \
-                 A Tower middleware likely cleared or replaced request extensions. \
-                 Middleware that intercepts extensions must preserve the RequestRegistryGuard."
+                "actix_tower: Request ID missing from http::Request extensions. \
+                 A Tower middleware likely cleared or replaced request extensions."
                     .to_owned(),
             )) as BoxError))
         })?;
-
-    let req_id = guard.req_id;
-    // Disarm: we take ownership of cleanup from here.
-    std::mem::forget(guard);
 
     // --- Retrieve the original HttpRequest -------------------------------------
     let http_req = REQUEST_REGISTRY
@@ -172,47 +160,4 @@ pub async fn http_to_service_request(
     };
 
     Ok(ServiceRequest::from_parts(http_req, payload))
-}
-
-// ---------------------------------------------------------------------------
-// Guards — ensure registry cleanup on all exit paths
-// ---------------------------------------------------------------------------
-
-/// Placed in `http::Request` extensions to clean up `REQUEST_REGISTRY` on drop.
-///
-/// `mem::forget`-ted by `http_to_service_request` once the entry is explicitly
-/// removed, so cleanup never runs twice.
-#[derive(Clone)]
-pub struct RequestRegistryGuard {
-    pub(crate) req_id: u64,
-}
-
-impl Drop for RequestRegistryGuard {
-    fn drop(&mut self) {
-        let req_opt = REQUEST_REGISTRY.with(|registry| {
-            registry.borrow_mut().remove(&self.req_id)
-        });
-        if let Some(req) = req_opt {
-            RESPONSE_REGISTRY.with(|registry| {
-                registry.borrow_mut().insert(self.req_id, req);
-            });
-        }
-    }
-}
-
-/// Placed in `http::Response` extensions to clean up `RESPONSE_REGISTRY` on drop.
-///
-/// `mem::forget`-ted by `TowerMiddlewareService::call` once the entry is
-/// explicitly removed.
-#[derive(Clone)]
-pub struct ResponseRegistryGuard {
-    pub(crate) req_id: u64,
-}
-
-impl Drop for ResponseRegistryGuard {
-    fn drop(&mut self) {
-        RESPONSE_REGISTRY.with(|registry| {
-            registry.borrow_mut().remove(&self.req_id);
-        });
-    }
 }

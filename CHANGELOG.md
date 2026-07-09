@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-07-09
+
+### Fixed
+- **Critical Bug (Tower Compatibility):** Resolved a 502 Bad Gateway panic ("HttpRequest not found in registries") caused by aggressive registry `Drop` guards prematurely nuking tracked requests when Tower middleware (e.g., `TimeoutLayer` or Rate Limiters) dropped or short-circuited futures.
+- **Robustness:** Introduced `SyntheticResponseError` to safely capture and translate synthetic HTTP responses from dropped futures into native Actix Web error handlers, completely preventing memory leaks and application crashes without locking overhead.
+
 ## [0.1.3] - 2026-07-07
 
 ### Added

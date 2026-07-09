@@ -39,12 +39,17 @@ use actix_web::{dev::ServiceResponse, Error};
 use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
 
+use crate::compat::http::status_from_http;
+use crate::compat::tower::header_bridge::copy_http_headers_to_actix;
 use crate::compat::tower::{
-    request::{REQUEST_REGISTRY, RESPONSE_REGISTRY, ResponseRegistryGuard},
+    body::TowerBodyStream,
+    request::{REQUEST_REGISTRY, RESPONSE_REGISTRY},
     response::http_to_service_response,
     service::ThreadSafeActixError,
 };
 use crate::internal::common::{BoxError, StringError, TowerError};
+use futures_util::TryStreamExt;
+use std::sync::Mutex;
 
 // ============================================================================
 // TowerMiddlewareFutureImpl
@@ -68,6 +73,18 @@ pin_project! {
         Done {
             _phantom: std::marker::PhantomData<(B, E)>,
         },
+    }
+    impl<F, B, E> PinnedDrop for TowerMiddlewareFutureImpl<F, B, E> {
+        fn drop(this: Pin<&mut Self>) {
+            if let TowerMiddlewareFutureImplProj::Running { req_id, .. } = this.project() {
+                REQUEST_REGISTRY.with(|registry| {
+                    registry.borrow_mut().remove(req_id);
+                });
+                RESPONSE_REGISTRY.with(|registry| {
+                    registry.borrow_mut().remove(req_id);
+                });
+            }
+        }
     }
 }
 
@@ -97,11 +114,18 @@ where
                 match inner.poll(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(result) => {
-                        self.set(TowerMiddlewareFutureImpl::Done {
+                        let actix_req = RESPONSE_REGISTRY
+                            .with(|registry| registry.borrow_mut().remove(&req_id))
+                            .or_else(|| {
+                                REQUEST_REGISTRY
+                                    .with(|registry| registry.borrow_mut().remove(&req_id))
+                            });
+
+                        self.as_mut().set(TowerMiddlewareFutureImpl::Done {
                             _phantom: std::marker::PhantomData,
                         });
 
-                        let mut http_response = result.map_err(|e| {
+                        let http_response = result.map_err(|e| {
                             let boxed: BoxError = e.into();
                             match boxed.downcast::<ThreadSafeActixError>() {
                                 Ok(wrapped) => actix_web::error::InternalError::new(
@@ -113,34 +137,20 @@ where
                             }
                         })?;
 
-                        // Retrieve and disarm ResponseRegistryGuard if present.
-                        let guard = http_response
-                            .extensions_mut()
-                            .remove::<ResponseRegistryGuard>();
-                        if let Some(g) = guard {
-                            std::mem::forget(g);
+                        if let Some(req) = actix_req {
+                            Poll::Ready(Ok(http_to_service_response(http_response, req)))
+                        } else {
+                            // The Tower middleware generated a response, but the Actix request
+                            // was dropped (e.g. by a TimeoutLayer dropping the inner future).
+                            // We return a custom ResponseError so Actix Web can handle the HTTP response.
+                            let (parts, body) = http_response.into_parts();
+                            let synthetic_err = SyntheticResponseError {
+                                status: parts.status,
+                                headers: parts.headers,
+                                body: Mutex::new(Some(body)),
+                            };
+                            Poll::Ready(Err(Error::from(synthetic_err)))
                         }
-
-                        // Recover the original Actix HttpRequest from whichever
-                        // registry holds it (response → short-circuit → request).
-                        let actix_req = RESPONSE_REGISTRY
-                            .with(|registry| registry.borrow_mut().remove(&req_id))
-                            .or_else(|| {
-                                REQUEST_REGISTRY.with(|registry| {
-                                    registry.borrow_mut().remove(&req_id)
-                                })
-                            })
-                            .ok_or_else(|| {
-                                Error::from(TowerError(
-                                    Box::new(StringError(
-                                        "actix_tower: HttpRequest not found in registries. \
-                                         This is an internal bug; please file an issue."
-                                            .to_owned(),
-                                    )) as BoxError,
-                                ))
-                            })?;
-
-                        Poll::Ready(Ok(http_to_service_response(http_response, actix_req)))
                     }
                 }
             }
@@ -193,15 +203,13 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.as_mut().project() {
             ActixServiceWrapperFutureImplProj::Done => Poll::Pending,
-            ActixServiceWrapperFutureImplProj::Running { call_fut } => {
-                match call_fut.poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
-                        self.set(ActixServiceWrapperFutureImpl::Done);
-                        Poll::Ready(result)
-                    }
+            ActixServiceWrapperFutureImplProj::Running { call_fut } => match call_fut.poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.set(ActixServiceWrapperFutureImpl::Done);
+                    Poll::Ready(result)
                 }
-            }
+            },
         }
     }
 }
@@ -225,10 +233,18 @@ mod tests {
 
         let tower_size = size_of::<TowerFut>();
         // Overhead should be `u64` (req_id) + discriminant + inner future (1 byte) + padding -> ~16-24 bytes
-        assert!(tower_size <= 24, "TowerMiddlewareFutureImpl overhead {} is too large", tower_size);
+        assert!(
+            tower_size <= 24,
+            "TowerMiddlewareFutureImpl overhead {} is too large",
+            tower_size
+        );
 
         let actix_size = size_of::<ActixFut>();
-        assert!(actix_size <= 16, "ActixServiceWrapperFutureImpl size {} is too large", actix_size);
+        assert!(
+            actix_size <= 16,
+            "ActixServiceWrapperFutureImpl size {} is too large",
+            actix_size
+        );
     }
 
     #[test]
@@ -253,5 +269,55 @@ mod tests {
 
         fn assert_is_sized<T: Sized>() {}
         assert_is_sized::<TowerFut>();
+    }
+}
+
+// ============================================================================
+// SyntheticResponseError
+// ============================================================================
+
+struct SyntheticResponseError<B> {
+    status: http::StatusCode,
+    headers: http::HeaderMap,
+    body: Mutex<Option<B>>,
+}
+
+impl<B> std::fmt::Debug for SyntheticResponseError<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyntheticResponseError").finish()
+    }
+}
+
+impl<B> std::fmt::Display for SyntheticResponseError<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Synthetic response: {}", self.status)
+    }
+}
+
+impl<B> actix_web::ResponseError for SyntheticResponseError<B>
+where
+    B: HttpBody<Data = actix_web::web::Bytes> + 'static,
+    B::Error: std::fmt::Display + 'static,
+{
+    fn status_code(&self) -> actix_web::http::StatusCode {
+        status_from_http(self.status)
+    }
+
+    fn error_response(&self) -> actix_web::HttpResponse {
+        let mut builder = actix_web::HttpResponse::build(self.status_code());
+        let actix_headers = copy_http_headers_to_actix(&self.headers);
+        for (name, value) in actix_headers.iter() {
+            builder.append_header((name.clone(), value.clone()));
+        }
+
+        if let Some(body) = self.body.lock().unwrap().take() {
+            let body_stream = TowerBodyStream::new(body).map_err(|e| {
+                let boxed: BoxError = Box::new(StringError(e.0.to_string()));
+                TowerError(boxed)
+            });
+            builder.streaming(body_stream)
+        } else {
+            builder.finish()
+        }
     }
 }

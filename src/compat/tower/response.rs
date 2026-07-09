@@ -69,10 +69,6 @@ pub fn service_response_to_http(sr: ServiceResponse) -> Response<ActixResponseBo
     *response.headers_mut() = headers;
 
     response
-        .extensions_mut()
-        .insert(crate::compat::tower::request::ResponseRegistryGuard { req_id });
-
-    response
 }
 
 /// Converts an `http::Response<B>` into an Actix `ServiceResponse`.
